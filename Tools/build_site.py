@@ -35,7 +35,8 @@ from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, ".cache")
-OUT = os.path.abspath(os.path.join(HERE, "..", "public", "v1"))
+OUT = os.environ.get("FORMNT_OUT") or os.path.abspath(
+    os.path.join(HERE, "..", "public", "v1"))
 
 UA = os.environ.get("FORMNT_UA", "Form NT records reader nate@templebit.com")
 HEADERS = {"User-Agent": UA}
@@ -48,9 +49,34 @@ csv.field_size_limit(10_000_000)
 
 # ------------------------------------------------------------------ fetching
 
-def fetch(url, timeout=120):
-    req = urllib.request.Request(url, headers=HEADERS)
-    return urllib.request.urlopen(req, timeout=timeout).read()
+def fetch(url, timeout=120, attempts=5):
+    """GET with backoff.
+
+    EDGAR full-text search returns intermittent 500s on requests that succeed
+    when repeated verbatim, so a single failure means nothing. Retrying matters
+    more than it looks: without it a flaky minute produces a build with no
+    restatements in it, which reads as "no company restated anything" rather
+    than "the search was briefly unavailable".
+    """
+    last = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, headers=HEADERS)
+        try:
+            return urllib.request.urlopen(req, timeout=timeout).read()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 429:
+                wait = float(e.headers.get("Retry-After") or 5)
+            elif 500 <= e.code < 600:
+                wait = 1.5 * (2 ** attempt)
+            else:
+                raise
+        except Exception as e:
+            last = e
+            wait = 1.5 * (2 ** attempt)
+        if attempt < attempts - 1:
+            time.sleep(wait)
+    raise last
 
 
 def cached(name, url, fresh=False):
