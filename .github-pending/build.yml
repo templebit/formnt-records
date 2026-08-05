@@ -1,0 +1,102 @@
+# Goes in the records repo as .github/workflows/build.yml
+#
+# Rebuilds the published record site from government sources and deploys it to
+# GitHub Pages. The repo holds this workflow, build_site.py, and nothing else of
+# substance — the site itself is deployed as an artifact rather than committed,
+# so the repo stays small.
+#
+# One non-obvious thing: GitHub disables scheduled workflows on a repo after 60
+# days with no commits. This job commits meta.json every run, which both keeps
+# the schedule alive and leaves an audit trail of what was published when.
+
+name: Build records
+
+on:
+  schedule:
+    # Twice daily. The House archive is regenerated each morning US time and
+    # EDGAR indexes update through the day.
+    - cron: "0 12 * * *"
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+    inputs:
+      allow_drop:
+        description: "Publish even if the record count fell sharply"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write      # to commit meta.json
+  pages: write
+  id-token: write
+
+concurrency:
+  group: records
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pypdf
+
+      # Be a good citizen with the source agencies: reuse the big quarterly
+      # downloads instead of pulling them twice a day.
+      - uses: actions/cache@v4
+        with:
+          path: Tools/.cache
+          key: sources-${{ github.run_id }}
+          restore-keys: sources-
+
+      - name: Build
+        env:
+          # The SEC requires a descriptive User-Agent with a contact address and
+          # returns 403 without one. Set FORMNT_UA as a repository variable.
+          FORMNT_UA: ${{ vars.FORMNT_UA }}
+        run: |
+          test -n "$FORMNT_UA" || { echo "FORMNT_UA repository variable is not set"; exit 1; }
+          python3 Tools/build_site.py --limit 70 \
+            ${{ inputs.allow_drop && '--allow-drop' || '' }}
+
+      - name: Summarise
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          m = json.load(open("public/v1/meta.json"))
+          print(f"### {m['records']} records\n")
+          print(f"- built `{m['builtAt']}`")
+          print(f"- SEC {m['secRecords']}, congressional {m['ogeRecords']}")
+          print(f"- rules: {', '.join(m['rules'])}")
+          EOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      # Small commit each run: keeps the schedule from being auto-disabled and
+      # records what was published.
+      - name: Record what was published
+        run: |
+          mkdir -p history
+          cp public/v1/meta.json "history/$(date -u +%Y-%m-%dT%H%M)Z.json"
+          cp public/v1/meta.json meta-latest.json
+          git config user.name "records bot"
+          git config user.email "noreply@templebit.com"
+          git add history meta-latest.json
+          git commit -m "records: $(python3 -c "import json;print(json.load(open('public/v1/meta.json'))['records'])") records" || echo "nothing to commit"
+          git push
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
