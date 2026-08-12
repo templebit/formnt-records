@@ -1,13 +1,18 @@
 # Goes in the records repo as .github/workflows/build.yml
 #
-# Rebuilds the published record site from government sources and deploys it to
-# GitHub Pages. The repo holds this workflow, build_site.py, and nothing else of
-# substance — the site itself is deployed as an artifact rather than committed,
-# so the repo stays small.
+# Rebuilds the published record site from government sources and publishes it to
+# GitHub Pages. The repo holds this workflow, build_site.py, and the site itself
+# under docs/.
+#
+# Pages on that repo is configured the legacy way — source main:/docs — so the
+# site is committed rather than uploaded as an artifact. Pushing docs/ is what
+# deploys; there is no deploy job. Switching to artifact deployment would mean
+# flipping the Pages build type, and the site 404s between that flip and the
+# first successful run, so it stays on /docs.
 #
 # One non-obvious thing: GitHub disables scheduled workflows on a repo after 60
-# days with no commits. This job commits meta.json every run, which both keeps
-# the schedule alive and leaves an audit trail of what was published when.
+# days with no commits. This job commits every run, which both keeps the
+# schedule alive and leaves an audit trail of what was published when.
 
 name: Build records
 
@@ -25,9 +30,7 @@ on:
         default: false
 
 permissions:
-  contents: write      # to commit meta.json
-  pages: write
-  id-token: write
+  contents: write      # committing docs/ is the deploy
 
 concurrency:
   group: records
@@ -58,6 +61,11 @@ jobs:
           # The SEC requires a descriptive User-Agent with a contact address and
           # returns 403 without one. Set FORMNT_UA as a repository variable.
           FORMNT_UA: ${{ vars.FORMNT_UA }}
+          # Write over the live site, not into public/. Two reasons: docs/ is
+          # what Pages serves, and the drop guard compares each build against
+          # the meta.json already at this path — so it is checking against what
+          # is actually published rather than against an empty directory.
+          FORMNT_OUT: ${{ github.workspace }}/docs/v1
         run: |
           test -n "$FORMNT_UA" || { echo "FORMNT_UA repository variable is not set"; exit 1; }
           python3 Tools/build_site.py --limit 70 \
@@ -67,36 +75,24 @@ jobs:
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import json
-          m = json.load(open("public/v1/meta.json"))
+          m = json.load(open("docs/v1/meta.json"))
           print(f"### {m['records']} records\n")
           print(f"- built `{m['builtAt']}`")
           print(f"- SEC {m['secRecords']}, congressional {m['ogeRecords']}")
           print(f"- rules: {', '.join(m['rules'])}")
           EOF
 
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-      # Small commit each run: keeps the schedule from being auto-disabled and
-      # records what was published.
-      - name: Record what was published
+      # Pushing docs/ is the deploy. The history copy is what keeps the
+      # schedule from being auto-disabled on a quiet week, when the record set
+      # can come back byte-identical and docs/ alone would leave nothing to
+      # commit.
+      - name: Publish
         run: |
           mkdir -p history
-          cp public/v1/meta.json "history/$(date -u +%Y-%m-%dT%H%M)Z.json"
-          cp public/v1/meta.json meta-latest.json
+          cp docs/v1/meta.json "history/$(date -u +%Y-%m-%dT%H%M)Z.json"
+          cp docs/v1/meta.json meta-latest.json
           git config user.name "records bot"
           git config user.email "noreply@templebit.com"
-          git add history meta-latest.json
-          git commit -m "records: $(python3 -c "import json;print(json.load(open('public/v1/meta.json'))['records'])") records" || echo "nothing to commit"
+          git add docs history meta-latest.json
+          git commit -m "records: $(python3 -c "import json;print(json.load(open('docs/v1/meta.json'))['records'])") records" || echo "nothing to commit"
           git push
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - id: deploy
-        uses: actions/deploy-pages@v4
